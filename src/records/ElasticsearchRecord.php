@@ -38,6 +38,7 @@ class ElasticsearchRecord extends ActiveRecord
     const EVENT_BEFORE_CREATE_INDEX = 'beforeCreateIndex';
     const EVENT_BEFORE_SAVE = 'beforeSave';
     const EVENT_BEFORE_SEARCH = 'beforeSearch';
+    const EVENT_AFTER_INDEX = 'afterIndex';
     public static $siteId;
     private $_schema;
     private $_attributes = ['title', 'url', 'elementHandle', 'content', 'postDate', 'expiryDate', 'noPostDate', 'noExpiryDate'];

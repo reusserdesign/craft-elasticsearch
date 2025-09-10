@@ -16,6 +16,7 @@ use lhs\elasticsearch\models\IndexableElementModel;
 use yii\console\Controller;
 use yii\console\ExitCode;
 use yii\helpers\Console;
+use lhs\elasticsearch\records\ElasticsearchRecord;
 
 /**
  * Manage Craft Elasticsearch indexes from the command line
@@ -174,6 +175,8 @@ class ElasticsearchController extends Controller
         }
         $this->stdout($message);
         $this->stdout(PHP_EOL);
+
+        (new ElasticsearchRecord)->trigger(ElasticsearchRecord::EVENT_AFTER_INDEX);
 
         return $exitCode;
     }
