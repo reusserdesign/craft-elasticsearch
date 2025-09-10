@@ -32,6 +32,8 @@
     >
         {{ csrfInput() }}
 
+        <input type="hidden" name="queue" value="1">
+
         <h2>{{ 'Sites'|t('elasticsearch') }}</h2>
         {{ forms.checkboxSelect({
             name: 'sites',
