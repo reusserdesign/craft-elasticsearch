@@ -58,6 +58,11 @@ class RefreshElasticsearchIndexUtility extends Utility
      */
     public static function badgeCount(): int
     {
+        // Use fast health check to avoid blocking CP on every request
+        if (!\reusser\services\ElasticsearchHealthService::isAvailable()) {
+            return 0; // Don't show badge if ES is down - prevents blocking
+        }
+
         try {
             if (!Elasticsearch::getInstance()->service->testConnection() || !Elasticsearch::getInstance()->service->isIndexInSync()) {
                 return 1;

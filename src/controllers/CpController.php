@@ -100,11 +100,14 @@ class CpController extends Controller
                 );
             }
 
+            // Spawn background queue runner to prevent blocking web request
+            $this->spawnQueueRunner();
+
             return $this->asJson(
                 [
                     'success' => true,
                     'skipped' => true,
-                    'reason' => 'Queueing job',
+                    'reason' => 'Queueing job (running in background)',
                 ]
             );
         }
@@ -205,6 +208,27 @@ class CpController extends Controller
             Craft::error(VarDumper::dumpAsString($e), __METHOD__);
 
             throw $e;
+        }
+    }
+
+    /**
+     * Spawn a background process to run the queue
+     *
+     * This prevents blocking the web request when queue jobs are heavy.
+     * Note: Uses exec() with only system-generated paths (no user input).
+     */
+    protected function spawnQueueRunner(): void
+    {
+        $phpBinary = PHP_BINARY;
+        $craftPath = Craft::getAlias('@root/craft');
+
+        $cmd = escapeshellarg($phpBinary) . ' ' . escapeshellarg($craftPath) . ' queue/run --verbose';
+
+        if (function_exists('exec')) {
+            exec($cmd . ' > /dev/null 2>&1 &');
+            Craft::info('Spawned background queue runner for Elasticsearch indexing', __METHOD__);
+        } else {
+            Craft::warning('exec() is disabled, queue will run on next web request', __METHOD__);
         }
     }
 }

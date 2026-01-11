@@ -1,63 +1,67 @@
 <?php
+
 /**
  * Elasticsearch plugin for Craft CMS 3.x
  *
  * Bring the power of Elasticsearch to you Craft 3 CMS project
  *
  * @link      https://www.lahautesociete.com
+ *
  * @copyright Copyright (c) 2018 La Haute Société
  */
 
 namespace lhs\elasticsearch;
 
 use Craft;
-use craft\base\Element;
+use yii\base\Event;
 use craft\base\Plugin;
-use craft\commerce\elements\Product;
-use craft\digitalproducts\elements\Product as DigitalProduct;
-use craft\console\Application as ConsoleApplication;
+use craft\queue\Queue;
+use craft\base\Element;
+use yii\queue\ExecEvent;
 use craft\elements\Asset;
 use craft\elements\Entry;
+use craft\models\Section;
+use craft\web\UrlManager;
+use craft\web\Application;
+use craft\services\Plugins;
 use craft\events\ModelEvent;
 use craft\events\PluginEvent;
-use craft\events\RegisterComponentTypesEvent;
-use craft\events\RegisterUrlRulesEvent;
+use craft\services\Utilities;
 use craft\helpers\ArrayHelper;
 use craft\helpers\ElementHelper;
-use craft\models\Section;
-use craft\queue\Queue;
-use craft\services\Plugins;
-use craft\services\Utilities;
-use craft\web\Application;
+use yii\elasticsearch\Exception;
+use yii\elasticsearch\Connection;
+use yii\elasticsearch\DebugPanel;
+use craft\commerce\elements\Product;
+use yii\debug\Module as DebugModule;
+use craft\events\RegisterUrlRulesEvent;
 use craft\web\twig\variables\CraftVariable;
-use craft\web\UrlManager;
-use lhs\elasticsearch\exceptions\IndexElementException;
 use lhs\elasticsearch\models\SettingsModel;
+use craft\events\RegisterComponentTypesEvent;
+use craft\console\Application as ConsoleApplication;
 use lhs\elasticsearch\services\ElasticsearchService;
 use lhs\elasticsearch\services\ElementIndexerService;
 use lhs\elasticsearch\services\IndexManagementService;
+use lhs\elasticsearch\variables\ElasticsearchVariable;
+use lhs\elasticsearch\exceptions\IndexElementException;
+use craft\digitalproducts\elements\Product as DigitalProduct;
 use lhs\elasticsearch\services\ReindexQueueManagementService;
 use lhs\elasticsearch\utilities\RefreshElasticsearchIndexUtility;
-use lhs\elasticsearch\variables\ElasticsearchVariable;
-use yii\base\Event;
-use yii\debug\Module as DebugModule;
-use yii\elasticsearch\Connection;
-use yii\elasticsearch\DebugPanel;
-use yii\elasticsearch\Exception;
-use yii\queue\ExecEvent;
 
 /**
  * @property  services\ElasticsearchService          service
  * @property  services\ReindexQueueManagementService reindexQueueManagementService
- * @property  services\ElementIndexerService         $elementIndexerService
- * @property  services\IndexManagementService        $indexManagementService
+ * @property services\ElementIndexerService $elementIndexerService
+ * @property services\IndexManagementService $indexManagementService
  * @property  SettingsModel                          settings
  * @property  Connection                             elasticsearch
- * @method    SettingsModel                          getSettings()
+ *
+ * @method SettingsModel getSettings()
  */
 class Elasticsearch extends Plugin
 {
     public const EVENT_ERROR_NO_ATTACHMENT_PROCESSOR = 'errorNoAttachmentProcessor';
+
     public const PLUGIN_HANDLE = 'elasticsearch';
 
     public bool $hasCpSettings = true;
@@ -70,10 +74,10 @@ class Elasticsearch extends Plugin
 
         $this->setComponents(
             [
-                'service'                       => ElasticsearchService::class,
+                'service' => ElasticsearchService::class,
                 'reindexQueueManagementService' => ReindexQueueManagementService::class,
-                'elementIndexerService'         => ElementIndexerService::class,
-                'indexManagementService'        => IndexManagementService::class,
+                'elementIndexerService' => ElementIndexerService::class,
+                'indexManagementService' => IndexManagementService::class,
             ]
         );
 
@@ -173,7 +177,7 @@ class Elasticsearch extends Plugin
                 if ($debugModule) {
                     $debugModule->panels['elasticsearch'] = new DebugPanel(
                         [
-                            'id'     => 'elasticsearch',
+                            'id' => 'elasticsearch',
                             'module' => $debugModule,
                         ]
                     );
@@ -206,15 +210,12 @@ class Elasticsearch extends Plugin
         Craft::info("{$this->name} plugin loaded", __METHOD__);
     }
 
-
     /**
      * Creates and returns the model used to store the plugin’s settings.
-     *
-     * @return SettingsModel
      */
     protected function createSettingsModel(): SettingsModel
     {
-        return new SettingsModel();
+        return new SettingsModel;
     }
 
     /**
@@ -222,6 +223,7 @@ class Elasticsearch extends Plugin
      * block on the settings page.
      *
      * @return string The rendered settings HTML
+     *
      * @throws \Twig\Error\LoaderError
      * @throws \Twig\Error\RuntimeError
      * @throws \Twig\Error\SyntaxError
@@ -231,7 +233,7 @@ class Elasticsearch extends Plugin
     {
         // Get and pre-validate the settings
         $settings = $this->getSettings();
-        //$settings->validate();
+        // $settings->validate();
 
         // Get the settings that are being defined by the config file
         $overrides = Craft::$app->getConfig()->getConfigFromFile(strtolower($this->handle));
@@ -256,9 +258,9 @@ class Elasticsearch extends Plugin
         return Craft::$app->view->renderTemplate(
             'elasticsearch/cp/settings',
             [
-                'settings'  => $settings,
+                'settings' => $settings,
                 'overrides' => array_keys($overrides),
-                'sections'  => $sections,
+                'sections' => $sections,
             ]
         );
     }
@@ -267,11 +269,11 @@ class Elasticsearch extends Plugin
     {
         $settings = $this->getSettings();
         $settings->elasticsearchComponentConfig = null;
+
         return parent::beforeSaveSettings();
     }
 
     /**
-     * @return Connection
      * @throws \yii\base\InvalidConfigException
      */
     public static function getConnection(): Connection
@@ -285,7 +287,9 @@ class Elasticsearch extends Plugin
 
     /**
      * Initialize the Elasticsearch connector
-     * @param SettingsModel|null $settings
+     *
+     * @param  SettingsModel|null  $settings
+     *
      * @throws \yii\base\InvalidConfigException If the configuration passed to the yii2-elasticsearch module is invalid
      */
     public function initializeElasticConnector($settings = null): void
@@ -303,11 +307,11 @@ class Elasticsearch extends Plugin
             $definition = [
                 'connectionTimeout' => 10,
                 'autodetectCluster' => false,
-                'nodes'             => [
+                'nodes' => [
                     [
-                        'protocol'     => $protocol ?? 'http',
+                        'protocol' => $protocol ?? 'http',
                         'http_address' => $endpointUrlWithoutProtocol,
-                        'http'         => ['publish_address' => $settings->elasticsearchEndpoint],
+                        'http' => ['publish_address' => $settings->elasticsearchEndpoint],
                     ],
                 ],
             ];
@@ -346,7 +350,6 @@ class Elasticsearch extends Plugin
 
     /**
      * Check for presence of Craft Commerce Plugin
-     * @return bool
      */
     public function isCommerceEnabled(): bool
     {
@@ -355,16 +358,12 @@ class Elasticsearch extends Plugin
 
     /**
      * Check for presence of Craft Digital Products Plugin
-     * @return bool
      */
     public function isDigitalProductsEnabled(): bool
     {
         return class_exists(\craft\digitalproducts\Plugin::class);
     }
 
-    /**
-     * @param ModelEvent $event
-     */
     public function onElementSaved(ModelEvent $event): void
     {
         /** @var Element $element */
@@ -393,7 +392,7 @@ class Elasticsearch extends Plugin
     protected function onPluginSettingsSaved(): void
     {
         /** @noinspection PhpUnhandledExceptionInspection If there was an error in the configuration, it would have prevented validation */
-        $this->initializeElasticConnector(); //FIXME: Check if this is needed
+        $this->initializeElasticConnector(); // FIXME: Check if this is needed
 
         Craft::debug('Elasticsearch plugin settings saved => re-index all elements', __METHOD__);
         try {
