@@ -49,8 +49,12 @@ class IndexElementJob extends BaseJob
             $element = $model->getElement();
         } catch (IndexableElementModelException $e) {
             Craft::warning("Element #{$this->elementId} (site #{$this->siteId}) not found, removing from Elasticsearch index", __METHOD__);
-            ElasticsearchRecord::$siteId = $this->siteId;
-            ElasticsearchRecord::deleteAll(['_id' => $this->elementId]);
+            try {
+                ElasticsearchRecord::$siteId = $this->siteId;
+                ElasticsearchRecord::deleteAll(['_id' => $this->elementId]);
+            } catch (\yii\elasticsearch\Exception $deleteException) {
+                Craft::warning("Element #{$this->elementId} not found in Elasticsearch index either, skipping", __METHOD__);
+            }
             return;
         }
 
