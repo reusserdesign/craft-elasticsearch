@@ -13,7 +13,9 @@ namespace lhs\elasticsearch\jobs;
 use Craft;
 use craft\queue\BaseJob;
 use lhs\elasticsearch\Elasticsearch;
+use lhs\elasticsearch\exceptions\IndexableElementModelException;
 use lhs\elasticsearch\models\IndexableElementModel;
+use lhs\elasticsearch\records\ElasticsearchRecord;
 
 /**
  * Reindex a single entry
@@ -42,7 +44,17 @@ class IndexElementJob extends BaseJob
         $model->elementId = $this->elementId;
         $model->siteId = $this->siteId;
         $model->type = $this->type;
-        Elasticsearch::getInstance()->elementIndexerService->indexElement($model->getElement());
+
+        try {
+            $element = $model->getElement();
+        } catch (IndexableElementModelException $e) {
+            Craft::warning("Element #{$this->elementId} (site #{$this->siteId}) not found, removing from Elasticsearch index", __METHOD__);
+            ElasticsearchRecord::$siteId = $this->siteId;
+            ElasticsearchRecord::deleteAll(['_id' => $this->elementId]);
+            return;
+        }
+
+        Elasticsearch::getInstance()->elementIndexerService->indexElement($element);
     }
 
     /**
