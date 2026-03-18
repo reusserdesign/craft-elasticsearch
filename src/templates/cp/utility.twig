@@ -24,6 +24,23 @@
     {% endif %}
 
     <form
+            id="reusser-indexing-utility"
+            class="utility"
+            action="{{ actionUrl('elasticsearch/run-indexing') }}"
+            method="post"
+            accept-charset="UTF-8"
+            style="margin-bottom: 24px;"
+    >
+        {{ csrfInput() }}
+        <input type="hidden" name="redirect" value="{{ craft.app.request.absoluteUrl }}">
+        <h2>{{ 'Product &amp; Submittal Index'|raw }}</h2>
+        <p>Re-indexes all products and submittals from JD Edwards with full keyword fields. Run this after the standard reindex below.</p>
+        <div class="buttons">
+            <input type="submit" class="btn submit" value="Reindex Products &amp; Submittals"/>
+        </div>
+    </form>
+
+    <form
             id="elasticsearch-utility"
             class="utility"
             action="{{ actionUrl('elasticsearch/cp/reindex-perform-action') }}"
