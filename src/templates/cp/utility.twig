@@ -32,7 +32,7 @@
             style="margin-bottom: 24px;"
     >
         {{ csrfInput() }}
-        <input type="hidden" name="redirect" value="{{ craft.app.request.absoluteUrl }}">
+        {{ redirectInput(craft.app.request.absoluteUrl) }}
         <h2>{{ 'Product &amp; Submittal Index'|raw }}</h2>
         <p>Re-indexes all products and submittals from JD Edwards with full keyword fields. Run this after the standard reindex below.</p>
         <div class="buttons">
