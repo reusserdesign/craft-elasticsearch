@@ -16,6 +16,7 @@ use craft\base\Component;
 use craft\records\Site;
 use lhs\elasticsearch\Elasticsearch as ElasticsearchPlugin;
 use lhs\elasticsearch\events\ErrorEvent;
+use lhs\elasticsearch\events\ReindexEvent;
 use lhs\elasticsearch\exceptions\IndexElementException;
 use lhs\elasticsearch\records\ElasticsearchRecord;
 use yii\helpers\Json;
@@ -26,6 +27,21 @@ class IndexManagementService extends Component
 {
     const SUFFIX_A = 'a';
     const SUFFIX_B = 'b';
+
+    /**
+     * Fired after the inactive physical index has been provisioned for a
+     * blue/green rebuild and before chunk jobs are queued. Listeners may
+     * enqueue their own jobs that write into the target index, and should
+     * call {@see reserveChunks()} so the alias swap waits for them.
+     */
+    const EVENT_BEFORE_REINDEX = 'beforeReindex';
+
+    /**
+     * Fired after the alias has been swapped to the newly built index. The
+     * event payload is a {@see ReindexEvent} (with `targetIndex` describing
+     * the index that is now live).
+     */
+    const EVENT_AFTER_REINDEX = 'afterReindex';
 
     /** @var ElasticsearchPlugin */
     public $plugin;
@@ -262,6 +278,152 @@ class IndexManagementService extends Component
         // Drop the stale physical index (if it exists).
         if ($command->indexExists($oldPhysical)) {
             $command->deleteIndex($oldPhysical);
+        }
+    }
+
+    /**
+     * Returns the in-progress reindex state for a site, or `null` if none.
+     * Shape: ['runId', 'targetIndex', 'targetSuffix', 'expectedChunks',
+     *         'completedChunks', 'startedAt'].
+     */
+    public function getReindexState(int $siteId): ?array
+    {
+        $state = Craft::$app->getCache()->get(self::reindexCacheKey($siteId));
+        return is_array($state) ? $state : null;
+    }
+
+    /**
+     * Begin tracking a new blue/green run. Initializes the cache marker so
+     * live writes can dual-write and chunk jobs can report completion.
+     *
+     * Fires {@see EVENT_BEFORE_REINDEX} so listeners can enqueue supplemental
+     * jobs and reserve additional chunks.
+     *
+     * @return array The state record (so the dispatcher can plumb runId/target).
+     */
+    public function beginReindex(int $siteId, string $targetIndex, string $targetSuffix, int $expectedChunks): array
+    {
+        $runId = uniqid('esreindex_', true);
+        $state = [
+            'runId'           => $runId,
+            'targetIndex'     => $targetIndex,
+            'targetSuffix'    => $targetSuffix,
+            'expectedChunks'  => $expectedChunks,
+            'completedChunks' => 0,
+            'startedAt'       => time(),
+        ];
+
+        Craft::$app->getCache()->set(self::reindexCacheKey($siteId), $state, 24 * 60 * 60);
+
+        ElasticsearchRecord::$siteId = $siteId;
+        $this->trigger(self::EVENT_BEFORE_REINDEX, new ReindexEvent([
+            'siteId'       => $siteId,
+            'runId'        => $runId,
+            'aliasName'    => ElasticsearchRecord::aliasName(),
+            'targetIndex'  => $targetIndex,
+            'targetSuffix' => $targetSuffix,
+        ]));
+
+        return $state;
+    }
+
+    /**
+     * Reserve additional chunks for an in-progress run. Intended for external
+     * integrations that enqueue their own jobs from an `EVENT_BEFORE_REINDEX`
+     * listener: by reserving, they ensure the alias swap waits until they
+     * call {@see reportChunkComplete()}.
+     *
+     * @return bool `false` if the run could not be found (already swapped or expired).
+     */
+    public function reserveChunks(int $siteId, string $runId, int $additionalChunks): bool
+    {
+        if ($additionalChunks <= 0) {
+            return true;
+        }
+
+        return $this->mutateRunState($siteId, $runId, function (array $state) use ($additionalChunks): array {
+            $state['expectedChunks'] = ($state['expectedChunks'] ?? 0) + $additionalChunks;
+            return $state;
+        }) !== null;
+    }
+
+    /**
+     * Report that a single chunk has finished. When `completedChunks` catches
+     * up to `expectedChunks`, the alias is swapped, the state is cleared, and
+     * {@see EVENT_AFTER_REINDEX} fires.
+     *
+     * @return bool `true` if this call performed the swap, `false` otherwise.
+     */
+    public function reportChunkComplete(int $siteId, string $runId): bool
+    {
+        $swapped = false;
+
+        $this->mutateRunState($siteId, $runId, function (array $state) use ($siteId, &$swapped): ?array {
+            $state['completedChunks'] = ($state['completedChunks'] ?? 0) + 1;
+
+            if ($state['completedChunks'] < $state['expectedChunks']) {
+                return $state;
+            }
+
+            // Final chunk: swap the alias, clear state, fire event.
+            $this->swapAlias($siteId, $state['targetSuffix']);
+            Craft::$app->getCache()->delete(self::reindexCacheKey($siteId));
+
+            ElasticsearchRecord::$siteId = $siteId;
+            $event = new ReindexEvent([
+                'siteId'       => $siteId,
+                'runId'        => $state['runId'],
+                'aliasName'    => ElasticsearchRecord::aliasName(),
+                'targetIndex'  => $state['targetIndex'],
+                'targetSuffix' => $state['targetSuffix'],
+            ]);
+            $this->trigger(self::EVENT_AFTER_REINDEX, $event);
+            // Backwards-compat: the legacy event lived on ElasticsearchRecord.
+            (new ElasticsearchRecord)->trigger(ElasticsearchRecord::EVENT_AFTER_INDEX, $event);
+
+            $swapped = true;
+            return null; // signal: cache already cleared
+        });
+
+        return $swapped;
+    }
+
+    /**
+     * Atomically read-modify-write the run state under a mutex. The mutator
+     * receives the current state and returns either:
+     *   - a new state array (will be stored), or
+     *   - `null` (no further action — caller has handled persistence/clearing).
+     *
+     * Returns the resulting state, or `null` if the run wasn't found / runId
+     * didn't match / the mutator opted out.
+     */
+    protected function mutateRunState(int $siteId, string $runId, callable $mutator): ?array
+    {
+        $cache = Craft::$app->getCache();
+        $cacheKey = self::reindexCacheKey($siteId);
+        $mutexKey = $cacheKey . '.lock';
+        $mutex = Craft::$app->getMutex();
+
+        if (!$mutex->acquire($mutexKey, 10)) {
+            Craft::error("Could not acquire reindex mutex for site #{$siteId}", __METHOD__);
+            return null;
+        }
+
+        try {
+            $state = $cache->get($cacheKey);
+            if (!is_array($state) || ($state['runId'] ?? null) !== $runId) {
+                return null;
+            }
+
+            $next = $mutator($state);
+            if ($next === null) {
+                return null;
+            }
+
+            $cache->set($cacheKey, $next, 24 * 60 * 60);
+            return $next;
+        } finally {
+            $mutex->release($mutexKey);
         }
     }
 

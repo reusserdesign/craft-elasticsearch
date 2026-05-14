@@ -129,8 +129,7 @@ class ElementIndexerService extends Component
      */
     protected function getReindexState(int $siteId): ?array
     {
-        $state = Craft::$app->getCache()->get(IndexManagementService::reindexCacheKey($siteId));
-        return is_array($state) ? $state : null;
+        return $this->plugin->indexManagementService->getReindexState($siteId);
     }
 
 

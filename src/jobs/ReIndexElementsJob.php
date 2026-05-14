@@ -15,6 +15,7 @@ namespace lhs\elasticsearch\jobs;
 use Craft;
 use craft\queue\BaseJob;
 use lhs\elasticsearch\Elasticsearch;
+use lhs\elasticsearch\events\ReindexEvent;
 use lhs\elasticsearch\records\ElasticsearchRecord;
 use lhs\elasticsearch\models\IndexableElementModel;
 use lhs\elasticsearch\services\IndexManagementService;
@@ -90,34 +91,36 @@ class ReIndexElementsJob extends BaseJob
         $targetSuffix = $indexManagement->getInactiveSuffix($this->siteId);
         $targetIndex = $indexManagement->createPhysicalIndex($this->siteId, $targetSuffix);
 
-        $runId = uniqid('esreindex_', true);
-
         if ($totalElements === 0) {
-            // Nothing to index — swap immediately so the (empty) target becomes
-            // the live alias, and clear any stale state.
-            $indexManagement->swapAlias($this->siteId, $targetSuffix);
-            $indexManagement->clearReindexState($this->siteId);
-            (new ElasticsearchRecord)->trigger(ElasticsearchRecord::EVENT_AFTER_INDEX);
+            // Nothing to index — open and immediately close a zero-chunk run.
+            // beginReindex fires EVENT_BEFORE_REINDEX so external integrations
+            // still get a chance to enqueue supplemental work and reserve
+            // their own chunks before the swap.
+            $state = $indexManagement->beginReindex($this->siteId, $targetIndex, $targetSuffix, 0);
+            if (($state['expectedChunks'] ?? 0) === 0) {
+                $indexManagement->swapAlias($this->siteId, $targetSuffix);
+                $indexManagement->clearReindexState($this->siteId);
+                $event = new ReindexEvent([
+                    'siteId'       => $this->siteId,
+                    'runId'        => $state['runId'],
+                    'aliasName'    => ElasticsearchRecord::aliasName(),
+                    'targetIndex'  => $targetIndex,
+                    'targetSuffix' => $targetSuffix,
+                ]);
+                $indexManagement->trigger(IndexManagementService::EVENT_AFTER_REINDEX, $event);
+                (new ElasticsearchRecord)->trigger(ElasticsearchRecord::EVENT_AFTER_INDEX, $event);
+            }
             $this->setProgress($queue, 1, 'No elements to index');
             return;
         }
 
         $totalChunks = (int)ceil($totalElements / $this->chunkSize);
 
-        // Publish the in-progress marker so live IndexElementJobs dual-write
+        // Publish the in-progress marker (and fire EVENT_BEFORE_REINDEX) so
+        // external listeners can hook in and live IndexElementJobs dual-write
         // into the rebuild target while chunks are still running.
-        Craft::$app->getCache()->set(
-            IndexManagementService::reindexCacheKey($this->siteId),
-            [
-                'runId'           => $runId,
-                'targetIndex'     => $targetIndex,
-                'targetSuffix'    => $targetSuffix,
-                'expectedChunks'  => $totalChunks,
-                'completedChunks' => 0,
-                'startedAt'       => time(),
-            ],
-            24 * 60 * 60
-        );
+        $state = $indexManagement->beginReindex($this->siteId, $targetIndex, $targetSuffix, $totalChunks);
+        $runId = $state['runId'];
 
         $this->setProgress($queue, 0, "Queuing {$totalChunks} chunk jobs for {$totalElements} elements...");
 
@@ -182,52 +185,18 @@ class ReIndexElementsJob extends BaseJob
     }
 
     /**
-     * Atomically increment the run's completion counter. When all chunks are
-     * accounted for, swap the alias to the rebuilt index and clear the marker.
+     * Notify the index management service that this chunk is finished. The
+     * service handles atomic increment, alias swap, and event firing.
      */
     protected function markChunkComplete(Elasticsearch $plugin): void
     {
-        if (empty($this->runId) || empty($this->targetIndex)) {
+        if (empty($this->runId)) {
             // Pre-blue/green job in flight (shouldn't happen post-deploy) — be safe.
             (new ElasticsearchRecord)->trigger(ElasticsearchRecord::EVENT_AFTER_INDEX);
             return;
         }
 
-        $cache = Craft::$app->getCache();
-        $cacheKey = IndexManagementService::reindexCacheKey($this->siteId);
-        $mutexKey = $cacheKey . '.lock';
-        $mutex = Craft::$app->getMutex();
-
-        if (!$mutex->acquire($mutexKey, 10)) {
-            Craft::error("Could not acquire reindex mutex for site #{$this->siteId}", __METHOD__);
-            return;
-        }
-
-        try {
-            $state = $cache->get($cacheKey);
-            if (!is_array($state) || ($state['runId'] ?? null) !== $this->runId) {
-                // The run was cleared (cancelled, superseded, or expired). Don't swap.
-                return;
-            }
-
-            $state['completedChunks'] = ($state['completedChunks'] ?? 0) + 1;
-
-            if ($state['completedChunks'] >= $state['expectedChunks']) {
-                // Final chunk: perform the alias swap and clear state.
-                try {
-                    $plugin->indexManagementService->swapAlias($this->siteId, $this->targetSuffix);
-                } catch (\Throwable $e) {
-                    Craft::error("Alias swap failed for site #{$this->siteId}: " . $e->getMessage(), __METHOD__);
-                    throw $e;
-                }
-                $cache->delete($cacheKey);
-                (new ElasticsearchRecord)->trigger(ElasticsearchRecord::EVENT_AFTER_INDEX);
-            } else {
-                $cache->set($cacheKey, $state, 24 * 60 * 60);
-            }
-        } finally {
-            $mutex->release($mutexKey);
-        }
+        $plugin->indexManagementService->reportChunkComplete($this->siteId, $this->runId);
     }
 
     /**
