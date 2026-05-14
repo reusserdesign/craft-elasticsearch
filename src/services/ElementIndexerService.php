@@ -50,45 +50,87 @@ class ElementIndexerService extends Component
      * @throws \yii\db\Exception
      * @throws \yii\db\StaleObjectException
      */
-    public function indexElement(Element $element): ?string
+    public function indexElement(Element $element, ?string $targetIndex = null): ?string
     {
         $reason = $this->getReasonForNotReindexing($element);
         if ($reason !== null) {
             return $reason;
         }
 
-        Craft::info("Indexing entry {$element->url}", __METHOD__);
+        // If no explicit target was passed but a reindex is in progress for this
+        // site, dual-write: once to the live alias, once to the inactive index
+        // being built.
+        if ($targetIndex === null) {
+            $state = $this->getReindexState($element->siteId);
+            if ($state !== null && !empty($state['targetIndex'])) {
+                $result = $this->writeRecord($element, $state['targetIndex']);
+                if ($result !== null) {
+                    return $result;
+                }
+                return $this->writeRecord($element, null);
+            }
+        }
+
+        return $this->writeRecord($element, $targetIndex);
+    }
+
+    /**
+     * Persist an element to a single index. Pass `null` to write to the alias
+     * (the default ActiveRecord path).
+     */
+    protected function writeRecord(Element $element, ?string $targetIndex): ?string
+    {
+        Craft::info("Indexing entry {$element->url}" . ($targetIndex ? " → {$targetIndex}" : ''), __METHOD__);
 
         $postDate = $element instanceof Asset ? $element->dateCreated : $element->postDate;
         $expiryDate = $element instanceof Asset ? null : $element->expiryDate;
 
-        $esRecord = $this->getElasticRecordForElement($element);
-        //@formatter:off
-        $esRecord->title         = $element->title;
-        $esRecord->url           = $element->url;
-        $esRecord->postDate      = $postDate ? Db::prepareDateForDb($postDate) : null;
-        $esRecord->noPostDate    = $postDate ? false : true;
-        $esRecord->expiryDate    = $expiryDate ? Db::prepareDateForDb($expiryDate) : null;
-        $esRecord->noExpiryDate  = $expiryDate ? false : true;
-        $esRecord->elementHandle = $element->refHandle();
-        //@formatter:on
-
-        $content = $this->getElementContent($element);
-        if ($content === false) {
-            $message = "Not indexing element #{$element->id} since it doesn't have a template.";
-            Craft::debug($message, __METHOD__);
-            return $message;
+        $previousOverride = ElasticsearchRecord::$overrideIndexName;
+        if ($targetIndex !== null) {
+            ElasticsearchRecord::$overrideIndexName = $targetIndex;
         }
 
-        $esRecord->content = base64_encode(trim($content));
+        try {
+            $esRecord = $this->getElasticRecordForElement($element);
+            //@formatter:off
+            $esRecord->title         = $element->title;
+            $esRecord->url           = $element->url;
+            $esRecord->postDate      = $postDate ? Db::prepareDateForDb($postDate) : null;
+            $esRecord->noPostDate    = $postDate ? false : true;
+            $esRecord->expiryDate    = $expiryDate ? Db::prepareDateForDb($expiryDate) : null;
+            $esRecord->noExpiryDate  = $expiryDate ? false : true;
+            $esRecord->elementHandle = $element->refHandle();
+            //@formatter:on
 
-        $isSuccessfullySaved = $esRecord->save();
+            $content = $this->getElementContent($element);
+            if ($content === false) {
+                $message = "Not indexing element #{$element->id} since it doesn't have a template.";
+                Craft::debug($message, __METHOD__);
+                return $message;
+            }
 
-        if (!$isSuccessfullySaved) {
-            throw new \yii\elasticsearch\Exception('Could not save elasticsearch record');
+            $esRecord->content = base64_encode(trim($content));
+
+            $isSuccessfullySaved = $esRecord->save();
+
+            if (!$isSuccessfullySaved) {
+                throw new \yii\elasticsearch\Exception('Could not save elasticsearch record');
+            }
+        } finally {
+            ElasticsearchRecord::$overrideIndexName = $previousOverride;
         }
 
         return null;
+    }
+
+    /**
+     * Read the in-progress reindex marker for a site, or `null` if none.
+     * @return array|null
+     */
+    protected function getReindexState(int $siteId): ?array
+    {
+        $state = Craft::$app->getCache()->get(IndexManagementService::reindexCacheKey($siteId));
+        return is_array($state) ? $state : null;
     }
 
 
@@ -104,7 +146,27 @@ class ElementIndexerService extends Component
 
         ElasticsearchRecord::$siteId = $element->siteId;
 
-        return ElasticsearchRecord::deleteAll(['_id' => $element->id]);
+        $deleted = ElasticsearchRecord::deleteAll(['_id' => $element->id]);
+
+        // Mirror the delete into the rebuild target if a reindex is in progress,
+        // otherwise the element resurrects after the alias swap.
+        $state = $this->getReindexState($element->siteId);
+        if ($state !== null && !empty($state['targetIndex'])) {
+            $previousOverride = ElasticsearchRecord::$overrideIndexName;
+            ElasticsearchRecord::$overrideIndexName = $state['targetIndex'];
+            try {
+                ElasticsearchRecord::deleteAll(['_id' => $element->id]);
+            } catch (\Throwable $e) {
+                Craft::warning(
+                    "Failed mirroring delete of #{$element->id} into reindex target {$state['targetIndex']}: " . $e->getMessage(),
+                    __METHOD__
+                );
+            } finally {
+                ElasticsearchRecord::$overrideIndexName = $previousOverride;
+            }
+        }
+
+        return $deleted;
     }
 
     /**

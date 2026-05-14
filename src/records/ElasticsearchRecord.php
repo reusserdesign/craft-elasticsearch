@@ -40,6 +40,14 @@ class ElasticsearchRecord extends ActiveRecord
     const EVENT_BEFORE_SEARCH = 'beforeSearch';
     const EVENT_AFTER_INDEX = 'afterIndex';
     public static $siteId;
+
+    /**
+     * When set, overrides the index name returned by {@see index()}. Used to pin
+     * writes to a specific physical index (e.g. the inactive blue/green target)
+     * regardless of which one the alias currently points at.
+     * @var string|null
+     */
+    public static $overrideIndexName;
     private $_schema;
     private $_attributes = ['title', 'url', 'elementHandle', 'content', 'postDate', 'expiryDate', 'noPostDate', 'noExpiryDate'];
     private $_element;
@@ -122,6 +130,22 @@ class ElasticsearchRecord extends ActiveRecord
      */
     public static function index(): string
     {
+        if (static::$overrideIndexName !== null) {
+            return static::$overrideIndexName;
+        }
+
+        return static::aliasName();
+    }
+
+    /**
+     * The stable alias name for this site. Searches and live writes target this
+     * name; reindex jobs build a physical index ({@see physicalIndexName()})
+     * and atomically repoint the alias when done.
+     *
+     * @throws InvalidConfigException If the `$siteId` isn't set
+     */
+    public static function aliasName(): string
+    {
         if (static::$siteId === null) {
             throw new InvalidConfigException('siteId was not set');
         }
@@ -135,6 +159,15 @@ class ElasticsearchRecord extends ActiveRecord
         }
 
         return $indexName;
+    }
+
+    /**
+     * Returns the full physical index name for the given blue/green suffix
+     * (either 'a' or 'b').
+     */
+    public static function physicalIndexName(string $suffix): string
+    {
+        return static::aliasName() . '__' . $suffix;
     }
 
     /**

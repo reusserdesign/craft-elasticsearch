@@ -17,9 +17,13 @@ use craft\queue\BaseJob;
 use lhs\elasticsearch\Elasticsearch;
 use lhs\elasticsearch\records\ElasticsearchRecord;
 use lhs\elasticsearch\models\IndexableElementModel;
+use lhs\elasticsearch\services\IndexManagementService;
 
 /**
- * Reindex elements in Elasticsearch, chunked into batches
+ * Reindex elements in Elasticsearch, chunked into batches. Uses a blue/green
+ * strategy: the dispatcher provisions the inactive physical index, every chunk
+ * writes to that pinned target, and the final chunk swaps the alias and
+ * clears the in-progress marker.
  */
 class ReIndexElementsJob extends BaseJob
 {
@@ -43,6 +47,15 @@ class ReIndexElementsJob extends BaseJob
 
     /** @var bool Whether this is the dispatcher job (creates chunk jobs) */
     public $isDispatcher = true;
+
+    /** @var string|null Run identifier shared across all chunks of this reindex */
+    public $runId;
+
+    /** @var string|null Full name of the physical index this chunk should write to */
+    public $targetIndex;
+
+    /** @var string|null Blue/green suffix ('a' or 'b') of the target index */
+    public $targetSuffix;
 
     /**
      * {@inheritdoc}
@@ -71,12 +84,40 @@ class ReIndexElementsJob extends BaseJob
         $indexableElementModels = $plugin->service->getIndexableElementModels();
         $totalElements = count($indexableElementModels);
 
+        // Prepare the blue/green target.
+        $indexManagement = $plugin->indexManagementService;
+        $indexManagement->ensureAlias($this->siteId);
+        $targetSuffix = $indexManagement->getInactiveSuffix($this->siteId);
+        $targetIndex = $indexManagement->createPhysicalIndex($this->siteId, $targetSuffix);
+
+        $runId = uniqid('esreindex_', true);
+
         if ($totalElements === 0) {
+            // Nothing to index — swap immediately so the (empty) target becomes
+            // the live alias, and clear any stale state.
+            $indexManagement->swapAlias($this->siteId, $targetSuffix);
+            $indexManagement->clearReindexState($this->siteId);
+            (new ElasticsearchRecord)->trigger(ElasticsearchRecord::EVENT_AFTER_INDEX);
             $this->setProgress($queue, 1, 'No elements to index');
             return;
         }
 
-        $totalChunks = ceil($totalElements / $this->chunkSize);
+        $totalChunks = (int)ceil($totalElements / $this->chunkSize);
+
+        // Publish the in-progress marker so live IndexElementJobs dual-write
+        // into the rebuild target while chunks are still running.
+        Craft::$app->getCache()->set(
+            IndexManagementService::reindexCacheKey($this->siteId),
+            [
+                'runId'           => $runId,
+                'targetIndex'     => $targetIndex,
+                'targetSuffix'    => $targetSuffix,
+                'expectedChunks'  => $totalChunks,
+                'completedChunks' => 0,
+                'startedAt'       => time(),
+            ],
+            24 * 60 * 60
+        );
 
         $this->setProgress($queue, 0, "Queuing {$totalChunks} chunk jobs for {$totalElements} elements...");
 
@@ -84,13 +125,16 @@ class ReIndexElementsJob extends BaseJob
             $offset = $i * $this->chunkSize;
 
             Craft::$app->getQueue()->push(new self([
-                'siteId' => $this->siteId,
-                'elementId' => $this->elementId,
-                'type' => $this->type,
-                'chunkSize' => $this->chunkSize,
-                'offset' => $offset,
+                'siteId'        => $this->siteId,
+                'elementId'     => $this->elementId,
+                'type'          => $this->type,
+                'chunkSize'     => $this->chunkSize,
+                'offset'        => $offset,
                 'totalElements' => $totalElements,
-                'isDispatcher' => false,
+                'isDispatcher'  => false,
+                'runId'         => $runId,
+                'targetIndex'   => $targetIndex,
+                'targetSuffix'  => $targetSuffix,
             ]));
 
             $this->setProgress(
@@ -112,10 +156,11 @@ class ReIndexElementsJob extends BaseJob
 
         if ($chunkCount === 0) {
             $this->setProgress($queue, 1, 'Empty chunk, skipping');
+            $this->markChunkComplete($plugin);
             return;
         }
 
-        $chunkNumber = ($this->offset / $this->chunkSize) + 1;
+        $chunkNumber = ((int)($this->offset / $this->chunkSize)) + 1;
         $errorCount = 0;
 
         foreach ($chunk as $i => $indexableElementModel) {
@@ -133,10 +178,55 @@ class ReIndexElementsJob extends BaseJob
             }
         }
 
-        // Fire the after-index event on the last chunk
-        $isLastChunk = ($this->offset + $this->chunkSize) >= $this->totalElements;
-        if ($isLastChunk) {
+        $this->markChunkComplete($plugin);
+    }
+
+    /**
+     * Atomically increment the run's completion counter. When all chunks are
+     * accounted for, swap the alias to the rebuilt index and clear the marker.
+     */
+    protected function markChunkComplete(Elasticsearch $plugin): void
+    {
+        if (empty($this->runId) || empty($this->targetIndex)) {
+            // Pre-blue/green job in flight (shouldn't happen post-deploy) — be safe.
             (new ElasticsearchRecord)->trigger(ElasticsearchRecord::EVENT_AFTER_INDEX);
+            return;
+        }
+
+        $cache = Craft::$app->getCache();
+        $cacheKey = IndexManagementService::reindexCacheKey($this->siteId);
+        $mutexKey = $cacheKey . '.lock';
+        $mutex = Craft::$app->getMutex();
+
+        if (!$mutex->acquire($mutexKey, 10)) {
+            Craft::error("Could not acquire reindex mutex for site #{$this->siteId}", __METHOD__);
+            return;
+        }
+
+        try {
+            $state = $cache->get($cacheKey);
+            if (!is_array($state) || ($state['runId'] ?? null) !== $this->runId) {
+                // The run was cleared (cancelled, superseded, or expired). Don't swap.
+                return;
+            }
+
+            $state['completedChunks'] = ($state['completedChunks'] ?? 0) + 1;
+
+            if ($state['completedChunks'] >= $state['expectedChunks']) {
+                // Final chunk: perform the alias swap and clear state.
+                try {
+                    $plugin->indexManagementService->swapAlias($this->siteId, $this->targetSuffix);
+                } catch (\Throwable $e) {
+                    Craft::error("Alias swap failed for site #{$this->siteId}: " . $e->getMessage(), __METHOD__);
+                    throw $e;
+                }
+                $cache->delete($cacheKey);
+                (new ElasticsearchRecord)->trigger(ElasticsearchRecord::EVENT_AFTER_INDEX);
+            } else {
+                $cache->set($cacheKey, $state, 24 * 60 * 60);
+            }
+        } finally {
+            $mutex->release($mutexKey);
         }
     }
 
@@ -150,7 +240,7 @@ class ReIndexElementsJob extends BaseJob
         $type = ($pos = strrpos($this->type, '\\')) ? substr($this->type, $pos + 1) : $this->type;
 
         if (!$this->isDispatcher) {
-            $chunkNumber = ($this->offset / $this->chunkSize) + 1;
+            $chunkNumber = ((int)($this->offset / $this->chunkSize)) + 1;
             return Craft::t(
                 Elasticsearch::PLUGIN_HANDLE,
                 sprintf(
@@ -175,7 +265,7 @@ class ReIndexElementsJob extends BaseJob
     /**
      * @return string|null `null` if the element was successfully reindexed, an error message explaining why it wasn't otherwise
      *
-     * @throws IndexElementException
+     * @throws \lhs\elasticsearch\exceptions\IndexElementException
      * @throws \GuzzleHttp\Exception\GuzzleException
      * @throws \yii\base\InvalidConfigException
      * @throws \yii\db\Exception
@@ -190,7 +280,7 @@ class ReIndexElementsJob extends BaseJob
             return $e->getMessage();
         }
 
-        return Elasticsearch::getInstance()->elementIndexerService->indexElement($element);
+        return Elasticsearch::getInstance()->elementIndexerService->indexElement($element, $this->targetIndex);
     }
 
     public function getTtr()
