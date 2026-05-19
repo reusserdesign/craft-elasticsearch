@@ -38,7 +38,7 @@ class ReIndexElementsJob extends BaseJob
     public $type;
 
     /** @var int Number of elements per chunk */
-    public $chunkSize = 100;
+    public $chunkSize = 250;
 
     /** @var int Starting offset for this chunk (0 = dispatch chunks) */
     public $offset = 0;
