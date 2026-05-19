@@ -260,22 +260,27 @@ class IndexManagementService extends Component
 
         $db = ElasticsearchRecord::getDb();
         $command = $db->createCommand();
+        $activeSuffix = $this->getActiveSuffix($siteId);
 
-        // Legacy: if a concrete index is sitting on the alias name, it has to
-        // go before we can create the alias.
-        if ($command->indexExists($alias) && $this->getActiveSuffix($siteId) === null) {
-            $command->deleteIndex($alias);
-        }
-
+        // Build a single atomic actions list: drop the legacy concrete index
+        // (if any) AND repoint the alias in one request, so searches never
+        // see a moment where the alias name resolves to nothing.
         $actions = [];
-        if ($this->getActiveSuffix($siteId) !== null) {
+
+        if ($activeSuffix === null && $command->indexExists($alias)) {
+            // Legacy install: a concrete index is sitting on the alias name.
+            // `remove_index` deletes it as part of the same atomic call.
+            $actions[] = ['remove_index' => ['index' => $alias]];
+        } elseif ($activeSuffix !== null) {
             $actions[] = ['remove' => ['index' => '*', 'alias' => $alias]];
         }
+
         $actions[] = ['add' => ['index' => $newPhysical, 'alias' => $alias]];
 
         $db->post('_aliases', [], Json::encode(['actions' => $actions]));
 
-        // Drop the stale physical index (if it exists).
+        // Drop the stale physical index outside the atomic block; the alias is
+        // already pointing at the new one so this can't affect search.
         if ($command->indexExists($oldPhysical)) {
             $command->deleteIndex($oldPhysical);
         }
