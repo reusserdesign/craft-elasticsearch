@@ -79,4 +79,12 @@ class IndexElementJob extends BaseJob
             )
         );
     }
+
+    /**
+     * Auto-retry on SIGTERM worker kills (e.g. deploy stops supervisor).
+     */
+    public function canRetry($attempt, $error)
+    {
+        return $attempt < 3 && ReIndexElementsJob::isSignalTermination($error);
+    }
 }

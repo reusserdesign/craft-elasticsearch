@@ -260,4 +260,29 @@ class ReIndexElementsJob extends BaseJob
 
         return 60 * 60;
     }
+
+    /**
+     * Reindex jobs are routinely killed by SIGTERM when supervisor stops
+     * workers during a deploy. Auto-retry those (up to 3 attempts) so a
+     * deploy doesn't leave the run half-finished. Genuine errors still
+     * fail-out as before.
+     */
+    public function canRetry($attempt, $error)
+    {
+        return $attempt < 3 && self::isSignalTermination($error);
+    }
+
+    /**
+     * Returns true if the given error is a SIGTERM-style worker kill
+     * (Symfony Process reports it as "The process has been signaled with
+     * signal \"15\".").
+     */
+    public static function isSignalTermination($error): bool
+    {
+        $message = $error instanceof \Throwable ? $error->getMessage() : (string) $error;
+
+        return strpos($message, 'signal "15"') !== false
+            || strpos($message, 'SIGTERM') !== false
+            || strpos($message, 'has been signaled with signal') !== false;
+    }
 }
