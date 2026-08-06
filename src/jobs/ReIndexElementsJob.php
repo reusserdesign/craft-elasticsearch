@@ -177,8 +177,18 @@ class ReIndexElementsJob extends BaseJob
 
             if ($errorMessage !== null) {
                 $errorCount++;
-                $this->stderr($errorMessage);
+                // Not an error worth failing the chunk over: indexElement() returns a
+                // message for every element it declines to index (blacklisted, no URL,
+                // or an elementContentCallback that returned false). stderr() only
+                // exists on console controllers, so calling it here threw
+                // "Calling unknown method" and took the whole chunk down with it -
+                // leaving markChunkComplete() unreached and the alias swap pending.
+                Craft::info($errorMessage, __METHOD__);
             }
+        }
+
+        if ($errorCount > 0) {
+            Craft::info("Chunk {$chunkNumber}: skipped {$errorCount} of {$chunkCount} element(s)", __METHOD__);
         }
 
         $this->markChunkComplete($plugin);
