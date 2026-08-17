@@ -87,7 +87,7 @@ class ElasticsearchController extends Controller
      */
     protected function queueReindexAll(): int
     {
-        $siteIds = \Craft::$app->getSites()->getAllSiteIds();
+        $siteIds = \craft\records\Site::find()->select('id')->column();
 
         foreach ($siteIds as $siteId) {
             $job = new \lhs\elasticsearch\jobs\ReIndexElementsJob;
