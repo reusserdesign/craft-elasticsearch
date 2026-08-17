@@ -26,11 +26,33 @@ class ElasticsearchController extends Controller
     /** @var ElasticsearchPlugin */
     public $plugin;
 
+    /**
+     * @var bool Whether to dispatch the reindex to the queue as chunked jobs
+     * (the same strategy the control panel utility uses) instead of indexing
+     * synchronously in this process. Each chunk runs as its own queue job, so
+     * `queue/run` executes it in an isolated child process — avoiding the
+     * memory exhaustion a single long-running reindex process hits.
+     */
+    public $queue = false;
+
     public function init(): void
     {
         parent::init();
 
         $this->plugin = ElasticsearchPlugin::getInstance();
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function options($actionID): array
+    {
+        $options = parent::options($actionID);
+        if ($actionID === 'reindex-all') {
+            $options[] = 'queue';
+        }
+
+        return $options;
     }
 
     /**
@@ -45,9 +67,43 @@ class ElasticsearchController extends Controller
      */
     public function actionReindexAll(): int
     {
+        if ($this->queue) {
+            return $this->queueReindexAll();
+        }
+
         $indexableElementModels = $this->plugin->service->getIndexableElementModels();
 
         return $this->reindexElementsBlueGreen($indexableElementModels);
+    }
+
+    /**
+     * Push a dispatcher ReIndexElementsJob per site, mirroring the control
+     * panel utility's queue path. The dispatcher fans out chunk jobs that
+     * `queue/run` executes in isolated child processes, so no single process
+     * has to hold the whole index in memory. Chain with the queue runner to
+     * finish the work in the same cron:
+     *
+     *     craft elasticsearch/elasticsearch/reindex-all --queue && craft queue/run
+     */
+    protected function queueReindexAll(): int
+    {
+        $siteIds = \Craft::$app->getSites()->getAllSiteIds();
+
+        foreach ($siteIds as $siteId) {
+            $job = new \lhs\elasticsearch\jobs\ReIndexElementsJob;
+            $job->siteId = $siteId;
+            \craft\helpers\Queue::push(
+                job: $job,
+                priority: 10,
+                ttr: $job->getTtr(),
+            );
+
+            $this->stdout("Queued reindex dispatcher for site #{$siteId}." . PHP_EOL, Console::FG_GREEN);
+        }
+
+        $this->stdout('Run `craft queue/run` to process the jobs.' . PHP_EOL, Console::FG_YELLOW);
+
+        return ExitCode::OK;
     }
 
     /**
