@@ -59,7 +59,9 @@ class RefreshElasticsearchIndexUtility extends Utility
     public static function badgeCount(): int
     {
         // Use fast health check to avoid blocking CP on every request
-        if (!\reusser\services\ElasticsearchHealthService::isAvailable()) {
+        // The health service lives in the fmb0916 module, so other sites skip it
+        $healthService = '\reusser\services\ElasticsearchHealthService';
+        if (class_exists($healthService) && !$healthService::isAvailable()) {
             return 0; // Don't show badge if ES is down - prevents blocking
         }
 
