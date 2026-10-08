@@ -212,7 +212,7 @@ class IndexManagementService extends Component
 
         // Case 2: build __a and alias it.
         $this->createPhysicalIndex($siteId, self::SUFFIX_A);
-        $this->pointAliasTo($siteId, self::SUFFIX_A);
+        $this->swapAlias($siteId, self::SUFFIX_A);
     }
 
     /**
